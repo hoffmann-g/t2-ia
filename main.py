@@ -1,6 +1,10 @@
 import os
+import warnings
 import pandas as pd
+from sklearn.metrics import precision_score, recall_score, f1_score
 from openai import AsyncOpenAI
+
+warnings.filterwarnings('ignore', category=UserWarning, module='sklearn')
 from dotenv import load_dotenv
 from typing import List, Tuple
 import asyncio
@@ -17,9 +21,16 @@ logger = logging.getLogger(__name__)
 logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("openai").setLevel(logging.WARNING)
 
-client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+# Ollama (local)
+MODEL = "gemma2:2b"
+client = AsyncOpenAI(base_url="http://localhost:11434/v1", api_key="ollama")
 
-SAMPLE_SIZE = 300
+# OpenAI
+# MODEL = "gpt-4o-mini"
+# client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+SAMPLES_PER_CLASS = 5
+NUM_CLASSES = 20
 
 SYSTEM_PROMPT = """
 You are an assistant specialized in classifying customer support intents for a banking application.
@@ -30,16 +41,7 @@ You are an expert in classifying banking customer support messages.
 Your task is to classify the message below into one of the intents from the provided list.
 
 EXAMPLES:
-1. Message: "I am still waiting on my card?"
-   Intent: card_arrival
-2. Message: "How do I know if my top up was successful?"
-   Intent: top_up_failed
-3. Message: "Why was I charged for making a purchase?"
-   Intent: card_payment_fee_charged
-4. Message: "I need to change my PIN number"
-   Intent: change_pin
-5. Message: "Someone stole my card, what do I do?"
-   Intent: compromised_card
+{examples}
 
 AVAILABLE INTENTS:
 {intents_list}
@@ -71,24 +73,44 @@ def load_data(file_path: str) -> pd.DataFrame:
     return pd.read_csv(file_path)
 
 
-def get_unique_intents(df: pd.DataFrame) -> List[str]:
+def get_unique_intents(df: pd.DataFrame, num_classes: int = None) -> List[str]:
     """Extract list of unique intents from dataset."""
-    return sorted(df['category'].dropna().unique().tolist())
+    intents = sorted(df['category'].dropna().unique().tolist())
+    if num_classes:
+        return intents[:num_classes]
+    return intents
 
 
-async def classify_with_examples(message: str, intents: List[str]) -> str:
+def get_balanced_sample(df: pd.DataFrame, samples_per_class: int) -> pd.DataFrame:
+    """Get a balanced sample with N samples per class."""
+    return df.groupby('category').apply(
+        lambda x: x.sample(n=min(samples_per_class, len(x)), random_state=42)
+    ).reset_index(drop=True)
+
+
+def build_examples_from_train(train_df: pd.DataFrame) -> str:
+    """Build examples string with 1 example per category from training data."""
+    examples = []
+    for i, (intent, group) in enumerate(train_df.groupby('category'), 1):
+        sample_text = group.iloc[0]['text']
+        examples.append(f'{i}. Message: "{sample_text}"\n   Intent: {intent}')
+    return "\n".join(examples)
+
+
+async def classify_with_examples(message: str, intents: List[str], examples: str) -> str:
     """
     Classify a message using few-shot prompt (with examples).
     """
     intents_list = "\n".join([f"- {i}" for i in intents])
     prompt = PROMPT_WITH_EXAMPLES.format(
+        examples=examples,
         intents_list=intents_list,
         message=message
     )
 
     try:
         response = await client.chat.completions.create(
-            model="gpt-4o-mini",
+            model=MODEL,
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": prompt}
@@ -114,7 +136,7 @@ async def classify_without_examples(message: str, intents: List[str]) -> str:
 
     try:
         response = await client.chat.completions.create(
-            model="gpt-4o-mini",
+            model=MODEL,
             messages=[
                 {"role": "system", "content": SYSTEM_PROMPT},
                 {"role": "user", "content": prompt}
@@ -133,6 +155,7 @@ async def process_message(
     message: str,
     actual_intent: str,
     unique_intents: List[str],
+    examples: str,
     total_messages: int
 ) -> Tuple[str, str, str]:
     """
@@ -142,7 +165,7 @@ async def process_message(
     logger.info(f"[{idx + 1}/{total_messages}] Processing...")
 
     pred_with_examples, pred_without_examples = await asyncio.gather(
-        classify_with_examples(message, unique_intents),
+        classify_with_examples(message, unique_intents, examples),
         classify_without_examples(message, unique_intents)
     )
 
@@ -166,26 +189,32 @@ async def main_async():
     """Main async function."""
     logger.info("=" * 60)
     logger.info("FEW-SHOT vs ZERO-SHOT LEARNING COMPARISON")
+    logger.info(f"Model: {MODEL}")
     logger.info("Dataset: Banking77 (Intent Classification)")
     logger.info("=" * 60 + "\n")
 
-    logger.info("Loading dataset...")
+    logger.info("Loading datasets...")
     df = load_data("data/banking77_test.csv")
-    logger.info(f"Test set size: {len(df)} messages\n")
+    train_df = load_data("data/banking77_train.csv")
+    logger.info(f"Test set size: {len(df)} messages")
+    logger.info(f"Train set size: {len(train_df)} messages\n")
 
-    unique_intents = get_unique_intents(df)
-    logger.info(f"Number of intents: {len(unique_intents)}")
+    unique_intents = get_unique_intents(df, NUM_CLASSES)
+
+    df = df[df['category'].isin(unique_intents)]
+    train_df = train_df[train_df['category'].isin(unique_intents)]
+
+    examples = build_examples_from_train(train_df)
+    logger.info(f"Number of classes: {len(unique_intents)}")
+    logger.info(f"Few-shot examples: {len(unique_intents)} (1 per class)")
     logger.info("Sample intents:")
     for i, intent in enumerate(unique_intents[:5], 1):
         logger.info(f"  {i}. {intent}")
     logger.info(f"  ... and {len(unique_intents) - 5} more\n")
 
-    if SAMPLE_SIZE and SAMPLE_SIZE < len(df):
-        df = df.sample(n=SAMPLE_SIZE, random_state=42)
-        logger.info(f"Using random sample of {SAMPLE_SIZE} messages\n")
-
+    df = get_balanced_sample(df, SAMPLES_PER_CLASS)
     total_messages = len(df)
-    logger.info(f"Processing {total_messages} messages...\n")
+    logger.info(f"Test samples: {total_messages} ({SAMPLES_PER_CLASS} per class)\n")
 
     tasks = []
     for _, row in df.iterrows():
@@ -194,6 +223,7 @@ async def main_async():
             message=row['text'],
             actual_intent=row['category'],
             unique_intents=unique_intents,
+            examples=examples,
             total_messages=total_messages
         )
         tasks.append(task)
@@ -221,6 +251,30 @@ async def main_async():
         logger.info(">> Zero-shot (without examples) performed better")
     else:
         logger.info(">> Both methods had the same performance")
+
+    calculate_metrics(actual_intents, results_with_examples, "Few-Shot")
+    calculate_metrics(actual_intents, results_without_examples, "Zero-Shot")
+
+
+def calculate_metrics(actual: List[str], predicted: List[str], method_name: str):
+    """Calculate and display precision, recall, F1 for a method."""
+    all_labels = sorted(set(actual) | set(predicted))
+
+    precision = precision_score(actual, predicted, labels=all_labels, average='weighted', zero_division=0)
+    recall = recall_score(actual, predicted, labels=all_labels, average='weighted', zero_division=0)
+    f1 = f1_score(actual, predicted, labels=all_labels, average='weighted', zero_division=0)
+
+    precision_macro = precision_score(actual, predicted, labels=all_labels, average='macro', zero_division=0)
+    recall_macro = recall_score(actual, predicted, labels=all_labels, average='macro', zero_division=0)
+    f1_macro = f1_score(actual, predicted, labels=all_labels, average='macro', zero_division=0)
+
+    logger.info(f"\n{method_name} Metrics:")
+    logger.info(f"  Precision (weighted): {precision:.4f}")
+    logger.info(f"  Recall (weighted):    {recall:.4f}")
+    logger.info(f"  F1-Score (weighted):  {f1:.4f}")
+    logger.info(f"  Precision (macro):    {precision_macro:.4f}")
+    logger.info(f"  Recall (macro):       {recall_macro:.4f}")
+    logger.info(f"  F1-Score (macro):     {f1_macro:.4f}")
 
 
 def main():
