@@ -1,7 +1,7 @@
 import os
 import warnings
 import pandas as pd
-from sklearn.metrics import precision_score, recall_score, f1_score
+from sklearn.metrics import precision_score, recall_score, f1_score, confusion_matrix
 from openai import AsyncOpenAI
 
 warnings.filterwarnings('ignore', category=UserWarning, module='sklearn')
@@ -22,12 +22,12 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 logging.getLogger("openai").setLevel(logging.WARNING)
 
 # Ollama (local)
-MODEL = "gemma2:2b"
-client = AsyncOpenAI(base_url="http://localhost:11434/v1", api_key="ollama")
+# MODEL = "gemma2:2b"
+# client = AsyncOpenAI(base_url="http://localhost:11434/v1", api_key="ollama")
 
 # OpenAI
-# MODEL = "gpt-4o-mini"
-# client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+MODEL = "gpt-4o-mini"
+client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 SAMPLES_PER_CLASS = 5
 NUM_CLASSES = 20
@@ -275,6 +275,35 @@ def calculate_metrics(actual: List[str], predicted: List[str], method_name: str)
     logger.info(f"  Precision (macro):    {precision_macro:.4f}")
     logger.info(f"  Recall (macro):       {recall_macro:.4f}")
     logger.info(f"  F1-Score (macro):     {f1_macro:.4f}")
+
+    # Analyze errors per class
+    analyze_errors(actual, predicted, method_name)
+
+
+def analyze_errors(actual: List[str], predicted: List[str], method_name: str, top_n: int = 5):
+    """Analyze and display classes with most errors."""
+    from collections import Counter
+
+    # Count errors per class
+    errors_per_class = Counter()
+    confusion_pairs = Counter()
+
+    for a, p in zip(actual, predicted):
+        if a != p:
+            errors_per_class[a] += 1
+            confusion_pairs[(a, p)] += 1
+
+    if not errors_per_class:
+        logger.info(f"\n  {method_name} - No errors found!")
+        return
+
+    logger.info(f"\n  {method_name} - Classes with most errors:")
+    for intent, count in errors_per_class.most_common(top_n):
+        logger.info(f"    {intent}: {count} errors")
+
+    logger.info(f"\n  {method_name} - Most common confusions (actual -> predicted):")
+    for (actual_intent, pred_intent), count in confusion_pairs.most_common(top_n):
+        logger.info(f"    {actual_intent} -> {pred_intent}: {count}x")
 
 
 def main():
